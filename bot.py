@@ -19,12 +19,8 @@ UNIT_PINS = {
 }
 
 ADMIN_PIN = "2510"
-
 PRODUCTS = ["Largactil GTT", "Nozinan GTT", "Risperdal GTT"]
-
 DATA_FILE = "data.json"
-
-# ─── Data helpers ────────────────────────────────────────────────────────────
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -57,36 +53,33 @@ def flacon_badge(date_str):
         return f"🟠 Dans {d}j"
     return f"🟢 {d}j"
 
-# ─── Session store ────────────────────────────────────────────────────────────
-# sessions[chat_id] = {
-#   "state": "...",
-#   "is_admin": bool,
-#   "unit": str,
-#   "produit": str,
-#   "form": {...},
-#   "edit_idx": int or None,
-#   "page": int
-# }
 sessions = {}
 
 def get_session(chat_id):
     if chat_id not in sessions:
-        sessions[chat_id] = {"state": "start", "is_admin": False, "unit": None, "produit": None, "form": {}, "edit_idx": None, "page": 0}
+        sessions[chat_id] = {
+            "state": "start", "is_admin": False, "unit": None,
+            "produit": None, "form": {}, "edit_idx": None, "page": 0
+        }
     return sessions[chat_id]
-
-# ─── Keyboards ────────────────────────────────────────────────────────────────
 
 def main_menu_keyboard(is_admin=False):
     rows = []
     for i in range(0, len(UNITS), 4):
         rows.append([InlineKeyboardButton(u, callback_data=f"unit_{u}") for u in UNITS[i:i+4]])
     if is_admin:
-        rows.append([InlineKeyboardButton("🔓 Mode Admin actif", callback_data="noop")])
-    rows.append([InlineKeyboardButton("🔑 Connexion Admin", callback_data="admin_login")])
+        rows.append([InlineKeyboardButton("✅ Mode Admin actif", callback_data="noop")])
+    else:
+        rows.append([InlineKeyboardButton("🔑 Connexion Admin", callback_data="admin_login")])
     return InlineKeyboardMarkup(rows)
 
 def product_keyboard(unit):
-    buttons = [[InlineKeyboardButton(f"{'✅ ' if load_data()[unit]['produit'] == p else ''}{p}", callback_data=f"prod_{p}")] for p in PRODUCTS]
+    data = load_data()
+    current = data[unit]["produit"]
+    buttons = []
+    for p in PRODUCTS:
+        label = f"✅ {p}" if current == p else p
+        buttons.append([InlineKeyboardButton(label, callback_data=f"prod_{p}")])
     buttons.append([InlineKeyboardButton("⬅️ Retour", callback_data="back_unit")])
     return InlineKeyboardMarkup(buttons)
 
@@ -94,18 +87,14 @@ def unit_keyboard(is_admin, unit, produit, page=0):
     data = load_data()
     patients = data[unit]["patients"]
     rows = []
-    # Product selector
     rows.append([InlineKeyboardButton(f"💊 {produit or 'Choisir produit'}", callback_data="change_product")])
-    # Patient list (5 per page)
     start = page * 5
     end = start + 5
-    page_patients = patients[start:end]
-    for i, p in enumerate(page_patients):
+    for i, p in enumerate(patients[start:end]):
         real_idx = start + i
         d = days_until(p.get("prochainFlacon", ""))
         icon = "🔴" if d is not None and d < 0 else "🟠" if d is not None and d <= 3 else "👤"
         rows.append([InlineKeyboardButton(f"{icon} {p['nomPrenom']}", callback_data=f"view_{real_idx}")])
-    # Pagination
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀️", callback_data=f"page_{page-1}"))
@@ -113,7 +102,6 @@ def unit_keyboard(is_admin, unit, produit, page=0):
         nav.append(InlineKeyboardButton("▶️", callback_data=f"page_{page+1}"))
     if nav:
         rows.append(nav)
-    # Admin actions
     if is_admin:
         rows.append([InlineKeyboardButton("➕ Ajouter patient", callback_data="add_patient")])
     rows.append([InlineKeyboardButton("⬅️ Retour unités", callback_data="back_main")])
@@ -136,13 +124,11 @@ def confirm_delete_keyboard(idx):
     ])
 
 def cancel_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Annuler", callback_data="back_unit")]])
-
-# ─── Message builders ─────────────────────────────────────────────────────────
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Annuler", callback_data="back_main")]])
 
 def unit_header(unit, produit, is_admin, data):
     patients = data[unit]["patients"]
-    alerts = sum(1 for p in patients if days_until(p.get("prochainFlacon","")) is not None and days_until(p.get("prochainFlacon","")) <= 3)
+    alerts = sum(1 for p in patients if days_until(p.get("prochainFlacon", "")) is not None and days_until(p.get("prochainFlacon", "")) <= 3)
     role = "👤 Admin" if is_admin else "👁 Consultation"
     text = f"🏥 *Unité {unit}*\n"
     text += f"💊 Produit : *{produit or 'Non défini'}*\n"
@@ -154,7 +140,7 @@ def unit_header(unit, produit, is_admin, data):
     return text
 
 def patient_card(p):
-    text = f"👤 *{p.get('nomPrenom','—')}*\n\n"
+    text = f"👤 *{p.get('nomPrenom', '—')}*\n\n"
     if p.get("date"):
         try:
             d = datetime.strptime(p["date"], "%Y-%m-%d").strftime("%d/%m/%Y")
@@ -176,11 +162,12 @@ def patient_card(p):
         text += f"📝 Notes : {p['notes']}\n"
     return text
 
-# ─── Handlers ─────────────────────────────────────────────────────────────────
-
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    sessions[chat_id] = {"state": "start", "is_admin": False, "unit": None, "produit": None, "form": {}, "edit_idx": None, "page": 0}
+    sessions[chat_id] = {
+        "state": "start", "is_admin": False, "unit": None,
+        "produit": None, "form": {}, "edit_idx": None, "page": 0
+    }
     await update.message.reply_text(
         "🏥 *H24TR — Suivi des Unités Hospitalières*\n\nChoisissez une unité ou connectez-vous en tant qu'admin :",
         parse_mode="Markdown",
@@ -193,7 +180,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     session = get_session(chat_id)
     state = session.get("state", "start")
 
-    # ── PIN entry ──
     if state == "await_pin":
         unit = session.get("unit")
         if text == ADMIN_PIN:
@@ -204,7 +190,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 unit_header(unit, produit, True, data),
                 parse_mode="Markdown",
-                reply_markup=unit_keyboard(True, unit, produit, session.get("page", 0))
+                reply_markup=unit_keyboard(True, unit, produit, 0)
             )
         elif unit and text == UNIT_PINS[unit]:
             session["is_admin"] = False
@@ -214,7 +200,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 unit_header(unit, produit, False, data),
                 parse_mode="Markdown",
-                reply_markup=unit_keyboard(False, unit, produit, session.get("page", 0))
+                reply_markup=unit_keyboard(False, unit, produit, 0)
             )
         else:
             await update.message.reply_text("❌ Code incorrect. Réessayez :", reply_markup=cancel_keyboard())
@@ -233,25 +219,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Code admin incorrect.", reply_markup=cancel_keyboard())
         return
 
-    # ── Form fields ──
-    form_states = {
-        "form_nom": ("nOrdonnance", "📋 *N° Ordonnance* (ou tapez `-` pour ignorer) :"),
-        "form_ord": ("date", "📅 *Date* format JJ/MM/AAAA (ou `-` pour ignorer) :"),
-        "form_date": ("nbreGTT", "💧 *Nbre de GTT* (ou `-` pour ignorer) :"),
-        "form_gtt": ("prochainFlacon", "🔮 *Date prochain flacon* format JJ/MM/AAAA (ou `-` pour ignorer) :"),
-        "form_flacon": ("notes", "📝 *Notes* (ou `-` pour ignorer) :"),
-    }
-
     if state == "form_nom":
         session["form"]["nomPrenom"] = text
         session["state"] = "form_ord"
-        await update.message.reply_text("📋 *N° Ordonnance* (ou tapez `-` pour ignorer) :", parse_mode="Markdown", reply_markup=cancel_keyboard())
+        await update.message.reply_text("📋 *N° Ordonnance* (ou `-` pour ignorer) :", parse_mode="Markdown", reply_markup=cancel_keyboard())
         return
 
     if state == "form_ord":
         session["form"]["nOrdonnance"] = "" if text == "-" else text
         session["state"] = "form_date"
-        await update.message.reply_text("📅 *Date* format JJ/MM/AAAA (ou `-` pour ignorer) :", parse_mode="Markdown", reply_markup=cancel_keyboard())
+        await update.message.reply_text("📅 *Date* format JJ/MM/AAAA (ou `-`) :", parse_mode="Markdown", reply_markup=cancel_keyboard())
         return
 
     if state == "form_date":
@@ -265,13 +242,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             session["form"]["date"] = ""
         session["state"] = "form_gtt"
-        await update.message.reply_text("💧 *Nbre de GTT* (ou `-` pour ignorer) :", parse_mode="Markdown", reply_markup=cancel_keyboard())
+        await update.message.reply_text("💧 *Nbre de GTT* (ou `-`) :", parse_mode="Markdown", reply_markup=cancel_keyboard())
         return
 
     if state == "form_gtt":
         session["form"]["nbreGTT"] = "" if text == "-" else text
         session["state"] = "form_flacon"
-        await update.message.reply_text("🔮 *Date prochain flacon* format JJ/MM/AAAA (ou `-` pour ignorer) :", parse_mode="Markdown", reply_markup=cancel_keyboard())
+        await update.message.reply_text("🔮 *Date prochain flacon* format JJ/MM/AAAA (ou `-`) :", parse_mode="Markdown", reply_markup=cancel_keyboard())
         return
 
     if state == "form_flacon":
@@ -285,12 +262,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             session["form"]["prochainFlacon"] = ""
         session["state"] = "form_notes"
-        await update.message.reply_text("📝 *Notes* (ou `-` pour ignorer) :", parse_mode="Markdown", reply_markup=cancel_keyboard())
+        await update.message.reply_text("📝 *Notes* (ou `-`) :", parse_mode="Markdown", reply_markup=cancel_keyboard())
         return
 
     if state == "form_notes":
         session["form"]["notes"] = "" if text == "-" else text
-        # Save patient
         data = load_data()
         unit = session["unit"]
         edit_idx = session.get("edit_idx")
@@ -314,9 +290,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Default
     await update.message.reply_text(
-        "🏥 *H24TR — Suivi des Unités Hospitalières*\n\nChoisissez une unité :",
+        "🏥 *H24TR*\n\nChoisissez une unité :",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(session.get("is_admin", False))
     )
@@ -331,7 +306,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data_cb == "noop":
         return
 
-    # ── Unit selection ──
     if data_cb.startswith("unit_"):
         unit = data_cb[5:]
         session["unit"] = unit
@@ -355,7 +329,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ── Admin login ──
     if data_cb == "admin_login":
         session["state"] = "await_admin_pin"
         await query.edit_message_text(
@@ -365,7 +338,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Back buttons ──
     if data_cb == "back_main":
         session["state"] = "start"
         await query.edit_message_text(
@@ -387,7 +359,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Product selection ──
     if data_cb == "change_product":
         unit = session.get("unit")
         await query.edit_message_text(
@@ -411,7 +382,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Pagination ──
     if data_cb.startswith("page_"):
         page = int(data_cb[5:])
         session["page"] = page
@@ -425,7 +395,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── View patient ──
     if data_cb.startswith("view_"):
         idx = int(data_cb[5:])
         unit = session["unit"]
@@ -442,7 +411,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Add patient ──
     if data_cb == "add_patient":
         session["state"] = "form_nom"
         session["form"] = {}
@@ -454,7 +422,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Edit patient ──
     if data_cb.startswith("edit_"):
         idx = int(data_cb[5:])
         unit = session["unit"]
@@ -464,20 +431,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         session["form"] = dict(p)
         session["edit_idx"] = idx
         await query.edit_message_text(
-            f"✏️ *Modifier patient*\n\n👤 *Nom et Prénom* (actuel: {p.get('nomPrenom','—')}) :",
+            f"✏️ *Modifier patient*\n\n👤 *Nom et Prénom* (actuel: {p.get('nomPrenom', '—')}) :",
             parse_mode="Markdown",
             reply_markup=cancel_keyboard()
         )
         return
 
-    # ── Delete patient ──
     if data_cb.startswith("delete_"):
         idx = int(data_cb[7:])
         unit = session["unit"]
         data = load_data()
         p = data[unit]["patients"][idx]
         await query.edit_message_text(
-            f"🗑️ *Supprimer {p.get('nomPrenom','ce patient')} ?*\n\nCette action est irréversible.",
+            f"🗑️ *Supprimer {p.get('nomPrenom', 'ce patient')} ?*\n\nCette action est irréversible.",
             parse_mode="Markdown",
             reply_markup=confirm_delete_keyboard(idx)
         )
@@ -491,10 +457,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_data(data)
         produit = session.get("produit") or data[unit]["produit"] or ""
         session["state"] = "unit"
-        await query.edit_message_text(
-            "✅ *Patient supprimé.*",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text("✅ *Patient supprimé.*", parse_mode="Markdown")
         await ctx.bot.send_message(
             chat_id,
             unit_header(unit, produit, session["is_admin"], data),
@@ -504,13 +467,12 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
 def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Bot started...")
-    app.run_polling()
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    logger.info("Bot H24TR started...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
-                             
