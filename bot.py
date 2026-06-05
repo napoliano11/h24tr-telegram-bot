@@ -1,35 +1,38 @@
 import os
 import json
 import logging
-from datetime import datetime, date
+import base64
+import httpx
+from datetime import datetime, date, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "YOUR_CLAUDE_KEY_HERE")
 
 UNITS = ["PUA", "PUB", "PUC", "PUF", "PBF", "AHA", "AHB", "AHC"]
-
 UNIT_PINS = {
     "PUA": "0101", "PUB": "0202", "PUC": "0202",
     "PUF": "0001", "PBF": "0002",
     "AHA": "0103", "AHB": "0104", "AHC": "0105"
 }
-
 ADMIN_PIN = "2510"
 PRODUCTS = ["Largactil GTT", "Nozinan GTT", "Risperdal GTT"]
 PRODUCT_ICONS = {"Largactil GTT": "💊", "Nozinan GTT": "💉", "Risperdal GTT": "🔬"}
+FLACON_CAPACITY = {"Largactil GTT": 1200, "Nozinan GTT": 1200, "Risperdal GTT": 60}
 DATA_FILE = "data.json"
+USERS_FILE = "users.json"
 
-# ─── Data ────────────────────────────────────────────────────────────────────
+# ─── Data ─────────────────────────────────────────────────────────────────────
 
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
-            # migrate old format if needed
             for u in UNITS:
                 if u not in d:
                     d[u] = {p: [] for p in PRODUCTS}
@@ -43,11 +46,34 @@ def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def load_users():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_users(users):
+    with open(USERS_FILE, "w") as f:
+        json.dump(users, f)
+
+def register_user(chat_id):
+    users = load_users()
+    users[str(chat_id)] = True
+    save_users(users)
+
 def days_until(date_str):
     if not date_str:
         return None
     try:
         return (datetime.strptime(date_str, "%Y-%m-%d").date() - date.today()).days
+    except:
+        return None
+
+def days_since_start(date_str):
+    if not date_str:
+        return None
+    try:
+        return (date.today() - datetime.strptime(date_str, "%Y-%m-%d").date()).days
     except:
         return None
 
@@ -59,7 +85,114 @@ def flacon_badge(date_str):
     if d <= 3: return f"🟠 Dans {d}j"
     return f"🟢 Dans {d}j"
 
-# ─── Sessions ────────────────────────────────────────────────────────────────
+def ordonnance_status(start_date_str, prochain_date_str):
+    if not start_date_str or not prochain_date_str:
+        return ""
+    try:
+        start = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+        prochain = datetime.strptime(prochain_date_str, "%Y-%m-%d").date()
+        days = (prochain - start).days
+        if days <= 7:
+            return "📋 Même ordonnance"
+        else:
+            return "🆕 Nouvelle ordonnance requise"
+    except:
+        return ""
+
+def is_patient_outdated(p):
+    pf = p.get("prochainFlacon", "")
+    if not pf:
+        return False
+    d = days_until(pf)
+    if d is not None and d < -3:
+        return True
+    return False
+
+def filter_patients(patients):
+    seen_names = {}
+    for p in patients:
+        name = p.get("nomPrenom", "").strip().lower()
+        pf = p.get("prochainFlacon", "")
+        if name not in seen_names:
+            seen_names[name] = p
+        else:
+            # keep the more recent one
+            existing_pf = seen_names[name].get("prochainFlacon", "")
+            if pf and (not existing_pf or pf > existing_pf):
+                seen_names[name] = p
+    result = []
+    for p in seen_names.values():
+        if not is_patient_outdated(p):
+            result.append(p)
+    return result
+
+# ─── Claude API ───────────────────────────────────────────────────────────────
+
+async def read_sheet_with_claude(image_bytes: bytes) -> list:
+    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+    prompt = """Tu es un assistant médical. Lis cette feuille de suivi hospitalier manuscrite.
+Extrais uniquement les patients qui ont des données valides.
+Retourne UNIQUEMENT un JSON valide, sans texte avant ou après, sans markdown.
+Format exact:
+[
+  {
+    "nomPrenom": "Nom complet",
+    "date": "JJ/MM/AAAA ou vide",
+    "nOrdonnance": "numéro ou vide",
+    "nbreGTT": "nombre ou vide",
+    "prochainFlacon": "JJ/MM/AAAA ou vide"
+  }
+]
+Si une valeur n'est pas lisible, mets une chaîne vide "".
+Ne retourne rien d'autre que le JSON."""
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-opus-4-5",
+                "max_tokens": 2000,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_b64
+                            }
+                        },
+                        {"type": "text", "text": prompt}
+                    ]
+                }]
+            }
+        )
+        result = response.json()
+        text = result["content"][0]["text"].strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        patients = json.loads(text)
+
+        # Convert dates to YYYY-MM-DD
+        converted = []
+        for p in patients:
+            for field in ["date", "prochainFlacon"]:
+                val = p.get(field, "")
+                if val:
+                    try:
+                        d = datetime.strptime(val, "%d/%m/%Y")
+                        p[field] = d.strftime("%Y-%m-%d")
+                    except:
+                        p[field] = ""
+            converted.append(p)
+        return converted
+
+# ─── Sessions ─────────────────────────────────────────────────────────────────
 
 sessions = {}
 
@@ -72,7 +205,8 @@ def new_session():
         "form": {},
         "edit_idx": None,
         "page": 0,
-        "last_msg_id": None
+        "pending_patients": [],
+        "pending_edit_idx": None
     }
 
 def get_session(chat_id):
@@ -80,7 +214,7 @@ def get_session(chat_id):
         sessions[chat_id] = new_session()
     return sessions[chat_id]
 
-# ─── Keyboards ───────────────────────────────────────────────────────────────
+# ─── Keyboards ────────────────────────────────────────────────────────────────
 
 def kb_start():
     return InlineKeyboardMarkup([
@@ -88,7 +222,7 @@ def kb_start():
         [InlineKeyboardButton("🔑  Administrateur", callback_data="role_admin")]
     ])
 
-def kb_units():
+def kb_units(is_admin=False):
     rows = []
     for i in range(0, len(UNITS), 4):
         rows.append([InlineKeyboardButton(u, callback_data=f"unit_{u}") for u in UNITS[i:i+4]])
@@ -100,12 +234,20 @@ def kb_products(back_cb="back_units"):
     rows.append([InlineKeyboardButton("⬅️ Retour", callback_data=back_cb)])
     return InlineKeyboardMarkup(rows)
 
+def kb_admin_list_options():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋  Ajouter une nouvelle liste", callback_data="admin_new_list")],
+        [InlineKeyboardButton("🔄  Mettre à jour la liste existante", callback_data="admin_update_list")],
+        [InlineKeyboardButton("➕  Ajouter un patient manuellement", callback_data="add_patient")],
+        [InlineKeyboardButton("⬅️ Changer médicament", callback_data="back_products")]
+    ])
+
 def kb_patient_list(unit, product, is_admin, page=0):
     data = load_data()
     patients = data[unit][product]
     rows = []
     if is_admin:
-        rows.append([InlineKeyboardButton("➕  Ajouter un patient", callback_data="add_patient")])
+        rows.append([InlineKeyboardButton("⚙️  Options liste", callback_data="admin_list_options")])
     start = page * 5
     for i, p in enumerate(patients[start:start+5]):
         idx = start + i
@@ -140,7 +282,22 @@ def kb_confirm_delete(idx):
     ])
 
 def kb_cancel():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌  Annuler la saisie", callback_data="back_list")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌  Annuler", callback_data="back_list")]])
+
+def kb_pending_confirm(total):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅  Confirmer et enregistrer", callback_data="pending_confirm")],
+        [InlineKeyboardButton("✏️  Modifier un patient", callback_data="pending_edit_select")],
+        [InlineKeyboardButton("🗑️  Supprimer un patient", callback_data="pending_delete_select")],
+        [InlineKeyboardButton("❌  Annuler tout", callback_data="back_list")]
+    ])
+
+def kb_pending_select(patients, action):
+    rows = []
+    for i, p in enumerate(patients):
+        rows.append([InlineKeyboardButton(f"{i+1}. {p['nomPrenom']}", callback_data=f"pending_{action}_{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Retour", callback_data="pending_review")])
+    return InlineKeyboardMarkup(rows)
 
 # ─── Text builders ────────────────────────────────────────────────────────────
 
@@ -179,25 +336,81 @@ def txt_patient_card(p):
         except: fd = p["prochainFlacon"]
         lines.append(f"🔮  *Prochain flacon :*  {fd}")
         lines.append(f"      {flacon_badge(p['prochainFlacon'])}")
+        ord_status = ordonnance_status(p.get("date",""), p.get("prochainFlacon",""))
+        if ord_status:
+            lines.append(f"      {ord_status}")
     if p.get("notes"):
         lines.append(f"📝  *Notes :*  {p['notes']}")
     lines.append(sep)
     return "\n".join(lines)
 
-# ─── Safe edit helper ─────────────────────────────────────────────────────────
+def txt_pending_list(patients):
+    lines = ["📋 *Patients extraits de la photo :*\n"]
+    for i, p in enumerate(patients):
+        pf = ""
+        if p.get("prochainFlacon"):
+            try: pf = datetime.strptime(p["prochainFlacon"], "%Y-%m-%d").strftime("%d/%m/%Y")
+            except: pf = p["prochainFlacon"]
+        dt = ""
+        if p.get("date"):
+            try: dt = datetime.strptime(p["date"], "%Y-%m-%d").strftime("%d/%m/%Y")
+            except: dt = p["date"]
+        lines.append(f"*{i+1}. {p.get('nomPrenom','—')}*")
+        if dt: lines.append(f"   📅 {dt}")
+        if p.get("nOrdonnance"): lines.append(f"   📋 {p['nOrdonnance']}")
+        if p.get("nbreGTT"): lines.append(f"   💧 {p['nbreGTT']} GTT/j")
+        if pf: lines.append(f"   🔮 Prochain : {pf}")
+        lines.append("")
+    return "\n".join(lines)
 
-async def safe_edit(query, text, keyboard):
-    try:
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
-    except Exception as e:
-        logger.warning(f"edit_message_text failed: {e}")
+# ─── Notifications ────────────────────────────────────────────────────────────
+
+async def send_morning_notifications(app):
+    data = load_data()
+    users = load_users()
+    today_str = date.today().strftime("%Y-%m-%d")
+    alerts = []
+    for unit in UNITS:
+        for product in PRODUCTS:
+            for p in data[unit][product]:
+                if p.get("prochainFlacon") == today_str:
+                    ord_status = ordonnance_status(p.get("date",""), p.get("prochainFlacon",""))
+                    alerts.append((unit, product, ord_status))
+    if not alerts:
+        return
+    # Group by unit
+    unit_alerts = {}
+    for unit, product, ord_status in alerts:
+        if unit not in unit_alerts:
+            unit_alerts[unit] = []
+        unit_alerts[unit].append(f"{PRODUCT_ICONS[product]} {product} — {ord_status}")
+    msg_lines = ["⏰ *Rappel flacons — 7h00*\n"]
+    for unit, items in unit_alerts.items():
+        msg_lines.append(f"🏥 *Unité {unit}*")
+        for item in items:
+            msg_lines.append(f"   • {item}")
+        msg_lines.append("")
+    msg_lines.append("_Connectez-vous avec votre code pour voir les détails._")
+    msg = "\n".join(msg_lines)
+    for chat_id in users:
+        try:
+            await app.bot.send_message(chat_id=int(chat_id), text=msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Could not notify {chat_id}: {e}")
 
 # ─── Handlers ─────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     sessions[chat_id] = new_session()
+    register_user(chat_id)
     await update.message.reply_text(txt_welcome(), parse_mode="Markdown", reply_markup=kb_start())
+
+async def safe_edit(query, text, keyboard):
+    try:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    except Exception as e:
+        logger.warning(f"edit failed: {e}")
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -206,7 +419,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cb = query.data
     s = get_session(chat_id)
 
-    # ── Start / roles ──
     if cb == "back_start":
         s.update(new_session())
         await safe_edit(query, txt_welcome(), kb_start())
@@ -223,11 +435,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, "🔑  *Connexion Admin*\n\nEntrez votre code administrateur :", None)
         return
 
-    # ── Units ──
     if cb == "back_units":
-        s["state"] = "select_unit"
         s["unit"] = None
-        title = "👁  *Consultation*\n\n" if not s["is_admin"] else "👤  *Admin*\n\n"
+        s["state"] = "select_unit"
+        title = "👤  *Admin*\n\n" if s["is_admin"] else "👁  *Consultation*\n\n"
         await safe_edit(query, f"{title}Choisissez votre unité :", kb_units())
         return
 
@@ -243,12 +454,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await safe_edit(query, f"🏥  *Unité {unit}*\n\n🔑  Entrez le code de l'unité :", None)
         return
 
-    # ── Products ──
     if cb == "back_products":
-        s["state"] = "select_product"
         s["product"] = None
-        unit = s["unit"]
-        await safe_edit(query, f"🏥  *Unité {unit}*\n\nChoisissez le médicament :", kb_products("back_units"))
+        s["state"] = "select_product"
+        await safe_edit(query, f"🏥  *Unité {s['unit']}*\n\nChoisissez le médicament :", kb_products("back_units"))
         return
 
     if cb.startswith("prod_"):
@@ -260,7 +469,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, txt_list_header(unit, product, s["is_admin"]), kb_patient_list(unit, product, s["is_admin"], 0))
         return
 
-    # ── List / pagination ──
     if cb == "back_list":
         unit = s["unit"]
         product = s["product"]
@@ -276,7 +484,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, txt_list_header(unit, product, s["is_admin"]), kb_patient_list(unit, product, s["is_admin"], page))
         return
 
-    # ── View patient ──
     if cb.startswith("view_"):
         idx = int(cb[5:])
         unit = s["unit"]
@@ -289,7 +496,17 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, txt_patient_card(patients[idx]), kb_patient_view(s["is_admin"], idx))
         return
 
-    # ── Add patient ──
+    # ── Admin list options ──
+    if cb == "admin_list_options":
+        await safe_edit(query, f"🏥 *Unité {s['unit']}*\n{PRODUCT_ICONS[s['product']]} *{s['product']}*\n\nQue voulez-vous faire ?", kb_admin_list_options())
+        return
+
+    if cb in ("admin_new_list", "admin_update_list"):
+        s["state"] = "await_photo"
+        s["list_action"] = cb
+        await safe_edit(query, "📸  *Envoyez la photo de la feuille de suivi*\n\nJe vais lire et extraire les patients automatiquement.", kb_cancel())
+        return
+
     if cb == "add_patient":
         s["state"] = "form_nom"
         s["form"] = {}
@@ -297,7 +514,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, "➕  *Nouveau patient*\n\n👤  Entrez le *Nom et Prénom* :", kb_cancel())
         return
 
-    # ── Edit patient ──
     if cb.startswith("edit_"):
         idx = int(cb[5:])
         data = load_data()
@@ -308,7 +524,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, f"✏️  *Modifier patient*\n\nNom actuel : *{p.get('nomPrenom','—')}*\n\n👤  Nouveau *Nom et Prénom* :", kb_cancel())
         return
 
-    # ── Delete patient ──
     if cb.startswith("delete_"):
         idx = int(cb[7:])
         data = load_data()
@@ -326,26 +541,108 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_data(data)
         s["state"] = "view_list"
         s["page"] = 0
-        await safe_edit(query, f"✅  *{nom}* supprimé avec succès.\n\n{txt_list_header(unit, product, True)}", kb_patient_list(unit, product, True, 0))
+        await safe_edit(query, f"✅  *{nom}* supprimé.\n\n{txt_list_header(unit, product, True)}", kb_patient_list(unit, product, True, 0))
+        return
+
+    # ── Pending patients review ──
+    if cb == "pending_review":
+        patients = s.get("pending_patients", [])
+        if not patients:
+            await safe_edit(query, "Aucun patient en attente.", kb_cancel())
+            return
+        await safe_edit(query, txt_pending_list(patients), kb_pending_confirm(len(patients)))
+        return
+
+    if cb == "pending_confirm":
+        patients = s.get("pending_patients", [])
+        unit = s["unit"]
+        product = s["product"]
+        data = load_data()
+        action = s.get("list_action", "admin_new_list")
+        if action == "admin_update_list":
+            data[unit][product] = []
+        for p in patients:
+            p["id"] = int(datetime.now().timestamp())
+            data[unit][product].append(p)
+        save_data(data)
+        s["pending_patients"] = []
+        s["state"] = "view_list"
+        s["page"] = 0
+        await safe_edit(query, f"✅  *{len(patients)} patient(s) enregistré(s) avec succès !*\n\n{txt_list_header(unit, product, True)}", kb_patient_list(unit, product, True, 0))
+        return
+
+    if cb == "pending_edit_select":
+        patients = s.get("pending_patients", [])
+        await safe_edit(query, "✏️  *Quel patient voulez-vous modifier ?*", kb_pending_select(patients, "edit"))
+        return
+
+    if cb == "pending_delete_select":
+        patients = s.get("pending_patients", [])
+        await safe_edit(query, "🗑️  *Quel patient voulez-vous supprimer ?*", kb_pending_select(patients, "delete"))
+        return
+
+    if cb.startswith("pending_edit_"):
+        idx = int(cb[13:])
+        s["pending_edit_idx"] = idx
+        s["state"] = "pending_form_nom"
+        s["form"] = dict(s["pending_patients"][idx])
+        p = s["pending_patients"][idx]
+        await safe_edit(query, f"✏️  *Modifier*\n\nNom actuel : *{p.get('nomPrenom','—')}*\n\n👤  Nouveau *Nom et Prénom* :", kb_cancel())
+        return
+
+    if cb.startswith("pending_delete_"):
+        idx = int(cb[15:])
+        nom = s["pending_patients"][idx].get("nomPrenom", "—")
+        s["pending_patients"].pop(idx)
+        patients = s["pending_patients"]
+        if not patients:
+            await safe_edit(query, "✅  Patient supprimé. Liste vide.", kb_cancel())
+            return
+        await safe_edit(query, f"✅  *{nom}* retiré.\n\n{txt_pending_list(patients)}", kb_pending_confirm(len(patients)))
         return
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    text = update.message.text.strip()
     s = get_session(chat_id)
     state = s.get("state", "start")
 
-    # ── Admin PIN ──
+    if update.message.photo and state == "await_photo":
+        await update.message.reply_text("📸  *Photo reçue. Lecture en cours...*\n\n⏳ Veuillez patienter.", parse_mode="Markdown")
+        try:
+            photo = update.message.photo[-1]
+            file = await ctx.bot.get_file(photo.file_id)
+            image_bytes = await file.download_as_bytearray()
+            patients_raw = await read_sheet_with_claude(bytes(image_bytes))
+            patients_filtered = filter_patients(patients_raw)
+            if not patients_filtered:
+                await update.message.reply_text("⚠️  Aucun patient valide trouvé dans la photo. Réessayez avec une image plus claire.")
+                return
+            s["pending_patients"] = patients_filtered
+            s["state"] = "pending_review"
+            await update.message.reply_text(
+                txt_pending_list(patients_filtered),
+                parse_mode="Markdown",
+                reply_markup=kb_pending_confirm(len(patients_filtered))
+            )
+        except Exception as e:
+            logger.error(f"Claude API error: {e}")
+            await update.message.reply_text(f"❌  Erreur lors de la lecture. Réessayez avec une image plus nette.")
+        return
+
+    if not update.message.text:
+        return
+
+    text = update.message.text.strip()
+
     if state == "await_admin_pin":
         if text == ADMIN_PIN:
             s["is_admin"] = True
             s["state"] = "select_unit"
-            await update.message.reply_text("✅  *Accès admin accordé !*\n\nChoisissez votre unité :", parse_mode="Markdown", reply_markup=kb_units())
+            await update.message.reply_text("✅  *Accès admin accordé !*\n\nChoisissez votre unité :", parse_mode="Markdown", reply_markup=kb_units(True))
         else:
             await update.message.reply_text("❌  Code incorrect. Réessayez :")
         return
 
-    # ── Unit PIN ──
     if state == "await_unit_pin":
         unit = s["unit"]
         if text == ADMIN_PIN:
@@ -359,97 +656,108 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌  Code incorrect. Réessayez :")
         return
 
-    # ── Patient form ──
-    if state == "form_nom":
+    # ── Patient form (manual) ──
+    form_state = state if not state.startswith("pending_") else state.replace("pending_", "")
+
+    async def next_form_step(current_state, field, next_state, next_question):
+        s["form"][field] = "" if text == "-" else text
+        s["state"] = next_state
+        await update.message.reply_text(next_question, parse_mode="Markdown", reply_markup=kb_cancel())
+
+    if state in ("form_nom", "pending_form_nom"):
         s["form"]["nomPrenom"] = text
-        s["state"] = "form_ord"
-        await update.message.reply_text("📋  *N° Ordonnance*\n\nEntrez le numéro (ou `-` pour ignorer) :", parse_mode="Markdown", reply_markup=kb_cancel())
+        s["state"] = "pending_form_ord" if state.startswith("pending_") else "form_ord"
+        await update.message.reply_text("📋  *N° Ordonnance*\n\n(ou `-` pour ignorer) :", parse_mode="Markdown", reply_markup=kb_cancel())
         return
 
-    if state == "form_ord":
+    if state in ("form_ord", "pending_form_ord"):
         s["form"]["nOrdonnance"] = "" if text == "-" else text
-        s["state"] = "form_date"
+        s["state"] = "pending_form_date" if state.startswith("pending_") else "form_date"
         await update.message.reply_text("📅  *Date de début*\n\nFormat JJ/MM/AAAA (ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
         return
 
-    if state == "form_date":
+    if state in ("form_date", "pending_form_date"):
         if text != "-":
             try:
                 s["form"]["date"] = datetime.strptime(text, "%d/%m/%Y").strftime("%Y-%m-%d")
             except:
-                await update.message.reply_text("⚠️  Format invalide ! Utilisez JJ/MM/AAAA\nEx : 05/06/2026  ou  `-` :", reply_markup=kb_cancel())
+                await update.message.reply_text("⚠️  Format invalide ! JJ/MM/AAAA ou `-` :", reply_markup=kb_cancel())
                 return
         else:
             s["form"]["date"] = ""
-        s["state"] = "form_gtt"
-        await update.message.reply_text("💧  *Nombre de GTT*\n\nEntrez le nombre (ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
+        s["state"] = "pending_form_gtt" if state.startswith("pending_") else "form_gtt"
+        await update.message.reply_text("💧  *Nombre de GTT*\n\n(ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
         return
 
-    if state == "form_gtt":
+    if state in ("form_gtt", "pending_form_gtt"):
         s["form"]["nbreGTT"] = "" if text == "-" else text
-        s["state"] = "form_flacon"
+        s["state"] = "pending_form_flacon" if state.startswith("pending_") else "form_flacon"
         await update.message.reply_text("🔮  *Date prochain flacon*\n\nFormat JJ/MM/AAAA (ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
         return
 
-    if state == "form_flacon":
+    if state in ("form_flacon", "pending_form_flacon"):
         if text != "-":
             try:
                 s["form"]["prochainFlacon"] = datetime.strptime(text, "%d/%m/%Y").strftime("%Y-%m-%d")
             except:
-                await update.message.reply_text("⚠️  Format invalide ! Utilisez JJ/MM/AAAA\nEx : 10/06/2026  ou  `-` :", reply_markup=kb_cancel())
+                await update.message.reply_text("⚠️  Format invalide ! JJ/MM/AAAA ou `-` :", reply_markup=kb_cancel())
                 return
         else:
             s["form"]["prochainFlacon"] = ""
-        s["state"] = "form_notes"
-        await update.message.reply_text("📝  *Notes / Remarques*\n\n(ou `-` pour ignorer) :", parse_mode="Markdown", reply_markup=kb_cancel())
+        s["state"] = "pending_form_notes" if state.startswith("pending_") else "form_notes"
+        await update.message.reply_text("📝  *Notes*\n\n(ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
         return
 
-    if state == "form_notes":
+    if state in ("form_notes", "pending_form_notes"):
         s["form"]["notes"] = "" if text == "-" else text
-        data = load_data()
-        unit = s["unit"]
-        product = s["product"]
-        edit_idx = s.get("edit_idx")
-        if edit_idx is not None:
-            data[unit][product][edit_idx] = {**data[unit][product][edit_idx], **s["form"]}
-            action = "modifié"
-        else:
-            s["form"]["id"] = int(datetime.now().timestamp())
-            data[unit][product].append(s["form"])
-            action = "ajouté"
-        save_data(data)
         saved = s["form"].copy()
-        s["form"] = {}
-        s["edit_idx"] = None
-        s["state"] = "view_list"
-        s["page"] = 0
-        await update.message.reply_text(
-            f"✅  *Patient {action} avec succès !*\n\n{txt_patient_card(saved)}",
-            parse_mode="Markdown"
-        )
-        await update.message.reply_text(
-            txt_list_header(unit, product, True),
-            parse_mode="Markdown",
-            reply_markup=kb_patient_list(unit, product, True, 0)
-        )
+
+        if state == "pending_form_notes":
+            idx = s.get("pending_edit_idx")
+            s["pending_patients"][idx] = saved
+            s["form"] = {}
+            s["pending_edit_idx"] = None
+            s["state"] = "pending_review"
+            patients = s["pending_patients"]
+            await update.message.reply_text(f"✅  Patient modifié !\n\n{txt_pending_list(patients)}", parse_mode="Markdown", reply_markup=kb_pending_confirm(len(patients)))
+        else:
+            data = load_data()
+            unit = s["unit"]
+            product = s["product"]
+            edit_idx = s.get("edit_idx")
+            if edit_idx is not None:
+                data[unit][product][edit_idx] = {**data[unit][product][edit_idx], **saved}
+                action = "modifié"
+            else:
+                saved["id"] = int(datetime.now().timestamp())
+                data[unit][product].append(saved)
+                action = "ajouté"
+            save_data(data)
+            s["form"] = {}
+            s["edit_idx"] = None
+            s["state"] = "view_list"
+            s["page"] = 0
+            await update.message.reply_text(f"✅  *Patient {action} !*\n\n{txt_patient_card(saved)}", parse_mode="Markdown")
+            await update.message.reply_text(txt_list_header(unit, product, True), parse_mode="Markdown", reply_markup=kb_patient_list(unit, product, True, 0))
         return
 
-    # ── Default ──
     await update.message.reply_text("Tapez /start pour commencer. 🏥")
 
 async def post_init(app):
-    await app.bot.set_my_commands([
-        BotCommand("start", "Démarrer / Accueil")
-    ])
+    await app.bot.set_my_commands([BotCommand("start", "Démarrer / Accueil")])
+    scheduler = AsyncIOScheduler(timezone="Africa/Algiers")
+    scheduler.add_job(send_morning_notifications, "cron", hour=7, minute=0, args=[app])
+    scheduler.start()
+    logger.info("Scheduler started.")
 
 def main():
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot H24TR started...")
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
-    
