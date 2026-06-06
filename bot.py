@@ -3,7 +3,7 @@ import json
 import logging
 import base64
 import httpx
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -12,7 +12,79 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "YOUR_CLAUDE_KEY_HERE")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_KEY_HERE")
+
+async def read_sheet_with_gemini(image_bytes: bytes) -> list:
+    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+    prompt = """Tu es un assistant médical. Lis cette feuille de suivi hospitalier manuscrite.
+Extrais uniquement les patients qui ont des données valides.
+Retourne UNIQUEMENT un JSON valide, sans texte avant ou après, sans markdown.
+Format exact:
+[
+  {
+    "nomPrenom": "Nom complet",
+    "date": "JJ/MM/AAAA ou vide",
+    "nOrdonnance": "numéro ou vide",
+    "nbreGTT": "nombre ou vide",
+    "prochainFlacon": "JJ/MM/AAAA ou vide"
+  }
+]
+Si une valeur n'est pas lisible, mets une chaîne vide "".
+Ne retourne rien d'autre que le JSON."""
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(url, json={
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
+                    {"text": prompt}
+                ]
+            }]
+        })
+        result = response.json()
+        text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        patients = json.loads(text)
+        converted = []
+        for p in patients:
+            for field in ["date", "prochainFlacon"]:
+                val = p.get(field, "")
+                if val:
+                    try:
+                        d = datetime.strptime(val, "%d/%m/%Y")
+                        p[field] = d.strftime("%Y-%m-%d")
+                    except:
+                        p[field] = ""
+            converted.append(p)
+        return converted
+
+def filter_patients(patients):
+    seen = {}
+    for p in patients:
+        name = p.get("nomPrenom", "").strip().lower()
+        pf = p.get("prochainFlacon", "")
+        if name not in seen:
+            seen[name] = p
+        else:
+            existing_pf = seen[name].get("prochainFlacon", "")
+            if pf and (not existing_pf or pf > existing_pf):
+                seen[name] = p
+    result = []
+    for p in seen.values():
+        pf = p.get("prochainFlacon", "")
+        if pf:
+            d = days_until_simple(pf)
+            if d is not None and d < -3:
+                continue
+        result.append(p)
+    return result
+
+def days_until_simple(date_str):
+    try:
+        return (datetime.strptime(date_str, "%Y-%m-%d").date() - date.today()).days
+    except:
+        return None
 
 UNITS = ["PUA", "PUB", "PUC", "PUF", "PBF", "AHA", "AHB", "AHC"]
 UNIT_PINS = {
@@ -23,7 +95,6 @@ UNIT_PINS = {
 ADMIN_PIN = "2510"
 PRODUCTS = ["Largactil GTT", "Nozinan GTT", "Risperdal GTT"]
 PRODUCT_ICONS = {"Largactil GTT": "💊", "Nozinan GTT": "💉", "Risperdal GTT": "🔬"}
-FLACON_CAPACITY = {"Largactil GTT": 1200, "Nozinan GTT": 1200, "Risperdal GTT": 60}
 DATA_FILE = "data.json"
 USERS_FILE = "users.json"
 
@@ -69,14 +140,6 @@ def days_until(date_str):
     except:
         return None
 
-def days_since_start(date_str):
-    if not date_str:
-        return None
-    try:
-        return (date.today() - datetime.strptime(date_str, "%Y-%m-%d").date()).days
-    except:
-        return None
-
 def flacon_badge(date_str):
     d = days_until(date_str)
     if d is None: return ""
@@ -99,99 +162,6 @@ def ordonnance_status(start_date_str, prochain_date_str):
     except:
         return ""
 
-def is_patient_outdated(p):
-    pf = p.get("prochainFlacon", "")
-    if not pf:
-        return False
-    d = days_until(pf)
-    if d is not None and d < -3:
-        return True
-    return False
-
-def filter_patients(patients):
-    seen_names = {}
-    for p in patients:
-        name = p.get("nomPrenom", "").strip().lower()
-        pf = p.get("prochainFlacon", "")
-        if name not in seen_names:
-            seen_names[name] = p
-        else:
-            # keep the more recent one
-            existing_pf = seen_names[name].get("prochainFlacon", "")
-            if pf and (not existing_pf or pf > existing_pf):
-                seen_names[name] = p
-    result = []
-    for p in seen_names.values():
-        if not is_patient_outdated(p):
-            result.append(p)
-    return result
-
-# ─── Claude API ───────────────────────────────────────────────────────────────
-
-async def read_sheet_with_claude(image_bytes: bytes) -> list:
-    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-    prompt = """Tu es un assistant médical. Lis cette feuille de suivi hospitalier manuscrite.
-Extrais uniquement les patients qui ont des données valides.
-Retourne UNIQUEMENT un JSON valide, sans texte avant ou après, sans markdown.
-Format exact:
-[
-  {
-    "nomPrenom": "Nom complet",
-    "date": "JJ/MM/AAAA ou vide",
-    "nOrdonnance": "numéro ou vide",
-    "nbreGTT": "nombre ou vide",
-    "prochainFlacon": "JJ/MM/AAAA ou vide"
-  }
-]
-Si une valeur n'est pas lisible, mets une chaîne vide "".
-Ne retourne rien d'autre que le JSON."""
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": CLAUDE_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
-            json={
-                "model": "claude-opus-4-5",
-                "max_tokens": 2000,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_b64
-                            }
-                        },
-                        {"type": "text", "text": prompt}
-                    ]
-                }]
-            }
-        )
-        result = response.json()
-        text = result["content"][0]["text"].strip()
-        text = text.replace("```json", "").replace("```", "").strip()
-        patients = json.loads(text)
-
-        # Convert dates to YYYY-MM-DD
-        converted = []
-        for p in patients:
-            for field in ["date", "prochainFlacon"]:
-                val = p.get(field, "")
-                if val:
-                    try:
-                        d = datetime.strptime(val, "%d/%m/%Y")
-                        p[field] = d.strftime("%Y-%m-%d")
-                    except:
-                        p[field] = ""
-            converted.append(p)
-        return converted
-
 # ─── Sessions ─────────────────────────────────────────────────────────────────
 
 sessions = {}
@@ -205,8 +175,7 @@ def new_session():
         "form": {},
         "edit_idx": None,
         "page": 0,
-        "pending_patients": [],
-        "pending_edit_idx": None
+        "list_action": None
     }
 
 def get_session(chat_id):
@@ -222,7 +191,7 @@ def kb_start():
         [InlineKeyboardButton("🔑  Administrateur", callback_data="role_admin")]
     ])
 
-def kb_units(is_admin=False):
+def kb_units():
     rows = []
     for i in range(0, len(UNITS), 4):
         rows.append([InlineKeyboardButton(u, callback_data=f"unit_{u}") for u in UNITS[i:i+4]])
@@ -234,11 +203,11 @@ def kb_products(back_cb="back_units"):
     rows.append([InlineKeyboardButton("⬅️ Retour", callback_data=back_cb)])
     return InlineKeyboardMarkup(rows)
 
-def kb_admin_list_options():
+def kb_admin_options():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋  Ajouter une nouvelle liste", callback_data="admin_new_list")],
-        [InlineKeyboardButton("🔄  Mettre à jour la liste existante", callback_data="admin_update_list")],
-        [InlineKeyboardButton("➕  Ajouter un patient manuellement", callback_data="add_patient")],
+        [InlineKeyboardButton("📸  Nouvelle liste via photo", callback_data="admin_photo_list")],
+        [InlineKeyboardButton("📋  Nouvelle liste manuelle", callback_data="admin_new_list")],
+        [InlineKeyboardButton("➕  Ajouter un patient", callback_data="add_patient")],
         [InlineKeyboardButton("⬅️ Changer médicament", callback_data="back_products")]
     ])
 
@@ -247,7 +216,7 @@ def kb_patient_list(unit, product, is_admin, page=0):
     patients = data[unit][product]
     rows = []
     if is_admin:
-        rows.append([InlineKeyboardButton("⚙️  Options liste", callback_data="admin_list_options")])
+        rows.append([InlineKeyboardButton("⚙️  Options", callback_data="admin_options")])
     start = page * 5
     for i, p in enumerate(patients[start:start+5]):
         idx = start + i
@@ -284,9 +253,15 @@ def kb_confirm_delete(idx):
 def kb_cancel():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌  Annuler", callback_data="back_list")]])
 
+def kb_confirm_clear():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅  Oui, effacer et recommencer", callback_data="confirm_clear")],
+        [InlineKeyboardButton("❌  Annuler", callback_data="back_list")]
+    ])
+
 def kb_pending_confirm(total):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅  Confirmer et enregistrer", callback_data="pending_confirm")],
+        [InlineKeyboardButton(f"✅  Confirmer ({total} patients)", callback_data="pending_confirm")],
         [InlineKeyboardButton("✏️  Modifier un patient", callback_data="pending_edit_select")],
         [InlineKeyboardButton("🗑️  Supprimer un patient", callback_data="pending_delete_select")],
         [InlineKeyboardButton("❌  Annuler tout", callback_data="back_list")]
@@ -298,6 +273,25 @@ def kb_pending_select(patients, action):
         rows.append([InlineKeyboardButton(f"{i+1}. {p['nomPrenom']}", callback_data=f"pending_{action}_{i}")])
     rows.append([InlineKeyboardButton("⬅️ Retour", callback_data="pending_review")])
     return InlineKeyboardMarkup(rows)
+
+def txt_pending_list(patients):
+    lines = ["📋 *Patients extraits de la photo :*\n"]
+    for i, p in enumerate(patients):
+        pf = ""
+        if p.get("prochainFlacon"):
+            try: pf = datetime.strptime(p["prochainFlacon"], "%Y-%m-%d").strftime("%d/%m/%Y")
+            except: pf = p["prochainFlacon"]
+        dt = ""
+        if p.get("date"):
+            try: dt = datetime.strptime(p["date"], "%Y-%m-%d").strftime("%d/%m/%Y")
+            except: dt = p["date"]
+        lines.append(f"*{i+1}. {p.get('nomPrenom','—')}*")
+        if dt: lines.append(f"   📅 {dt}")
+        if p.get("nOrdonnance"): lines.append(f"   📋 {p['nOrdonnance']}")
+        if p.get("nbreGTT"): lines.append(f"   💧 {p['nbreGTT']} GTT/j")
+        if pf: lines.append(f"   🔮 Prochain : {pf}")
+        lines.append("")
+    return "\n".join(lines)
 
 # ─── Text builders ────────────────────────────────────────────────────────────
 
@@ -344,46 +338,23 @@ def txt_patient_card(p):
     lines.append(sep)
     return "\n".join(lines)
 
-def txt_pending_list(patients):
-    lines = ["📋 *Patients extraits de la photo :*\n"]
-    for i, p in enumerate(patients):
-        pf = ""
-        if p.get("prochainFlacon"):
-            try: pf = datetime.strptime(p["prochainFlacon"], "%Y-%m-%d").strftime("%d/%m/%Y")
-            except: pf = p["prochainFlacon"]
-        dt = ""
-        if p.get("date"):
-            try: dt = datetime.strptime(p["date"], "%Y-%m-%d").strftime("%d/%m/%Y")
-            except: dt = p["date"]
-        lines.append(f"*{i+1}. {p.get('nomPrenom','—')}*")
-        if dt: lines.append(f"   📅 {dt}")
-        if p.get("nOrdonnance"): lines.append(f"   📋 {p['nOrdonnance']}")
-        if p.get("nbreGTT"): lines.append(f"   💧 {p['nbreGTT']} GTT/j")
-        if pf: lines.append(f"   🔮 Prochain : {pf}")
-        lines.append("")
-    return "\n".join(lines)
-
 # ─── Notifications ────────────────────────────────────────────────────────────
 
 async def send_morning_notifications(app):
     data = load_data()
     users = load_users()
     today_str = date.today().strftime("%Y-%m-%d")
-    alerts = []
+    unit_alerts = {}
     for unit in UNITS:
         for product in PRODUCTS:
             for p in data[unit][product]:
                 if p.get("prochainFlacon") == today_str:
+                    if unit not in unit_alerts:
+                        unit_alerts[unit] = []
                     ord_status = ordonnance_status(p.get("date",""), p.get("prochainFlacon",""))
-                    alerts.append((unit, product, ord_status))
-    if not alerts:
+                    unit_alerts[unit].append(f"{PRODUCT_ICONS[product]} {product} — {ord_status}")
+    if not unit_alerts:
         return
-    # Group by unit
-    unit_alerts = {}
-    for unit, product, ord_status in alerts:
-        if unit not in unit_alerts:
-            unit_alerts[unit] = []
-        unit_alerts[unit].append(f"{PRODUCT_ICONS[product]} {product} — {ord_status}")
     msg_lines = ["⏰ *Rappel flacons — 7h00*\n"]
     for unit, items in unit_alerts.items():
         msg_lines.append(f"🏥 *Unité {unit}*")
@@ -496,21 +467,96 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, txt_patient_card(patients[idx]), kb_patient_view(s["is_admin"], idx))
         return
 
-    # ── Admin list options ──
-    if cb == "admin_list_options":
-        await safe_edit(query, f"🏥 *Unité {s['unit']}*\n{PRODUCT_ICONS[s['product']]} *{s['product']}*\n\nQue voulez-vous faire ?", kb_admin_list_options())
+    if cb == "admin_options":
+        await safe_edit(query, f"🏥 *Unité {s['unit']}*\n{PRODUCT_ICONS[s['product']]} *{s['product']}*\n\nQue voulez-vous faire ?", kb_admin_options())
         return
 
-    if cb in ("admin_new_list", "admin_update_list"):
+    if cb == "admin_photo_list":
         s["state"] = "await_photo"
-        s["list_action"] = cb
+        s["pending_patients"] = []
         await safe_edit(query, "📸  *Envoyez la photo de la feuille de suivi*\n\nJe vais lire et extraire les patients automatiquement.", kb_cancel())
+        return
+
+    if cb == "admin_new_list":
+        data = load_data()
+        count = len(data[s["unit"]][s["product"]])
+        if count > 0:
+            await safe_edit(query, f"⚠️ *Attention !*\n\nCette action va effacer les *{count} patient(s)* existants et recommencer à zéro.\n\nConfirmer ?", kb_confirm_clear())
+        else:
+            s["state"] = "form_nom"
+            s["form"] = {}
+            s["edit_idx"] = None
+            s["list_action"] = "new_list"
+            await safe_edit(query, "📋  *Nouvelle liste*\n\n👤  Entrez le *Nom et Prénom* du premier patient :", kb_cancel())
+        return
+
+    if cb == "confirm_clear":
+        data = load_data()
+        data[s["unit"]][s["product"]] = []
+        save_data(data)
+        s["state"] = "form_nom"
+        s["form"] = {}
+        s["edit_idx"] = None
+        s["list_action"] = "new_list"
+        await safe_edit(query, "✅  Liste effacée.\n\n👤  Entrez le *Nom et Prénom* du premier patient :", kb_cancel())
+        return
+
+    if cb == "pending_review":
+        patients = s.get("pending_patients", [])
+        await safe_edit(query, txt_pending_list(patients), kb_pending_confirm(len(patients)))
+        return
+
+    if cb == "pending_confirm":
+        patients = s.get("pending_patients", [])
+        unit = s["unit"]
+        product = s["product"]
+        data = load_data()
+        data[unit][product] = []
+        for p in patients:
+            p["id"] = int(datetime.now().timestamp())
+            data[unit][product].append(p)
+        save_data(data)
+        s["pending_patients"] = []
+        s["state"] = "view_list"
+        s["page"] = 0
+        await safe_edit(query, f"✅  *{len(patients)} patient(s) enregistré(s) !*\n\n{txt_list_header(unit, product, True)}", kb_patient_list(unit, product, True, 0))
+        return
+
+    if cb == "pending_edit_select":
+        patients = s.get("pending_patients", [])
+        await safe_edit(query, "✏️  *Quel patient voulez-vous modifier ?*", kb_pending_select(patients, "edit"))
+        return
+
+    if cb == "pending_delete_select":
+        patients = s.get("pending_patients", [])
+        await safe_edit(query, "🗑️  *Quel patient voulez-vous supprimer ?*", kb_pending_select(patients, "delete"))
+        return
+
+    if cb.startswith("pending_edit_"):
+        idx = int(cb[13:])
+        s["pending_edit_idx"] = idx
+        s["state"] = "pending_form_nom"
+        s["form"] = dict(s["pending_patients"][idx])
+        p = s["pending_patients"][idx]
+        await safe_edit(query, f"✏️  *Modifier*\n\nNom actuel : *{p.get('nomPrenom','—')}*\n\n👤  Nouveau *Nom et Prénom* :", kb_cancel())
+        return
+
+    if cb.startswith("pending_delete_"):
+        idx = int(cb[15:])
+        nom = s["pending_patients"][idx].get("nomPrenom", "—")
+        s["pending_patients"].pop(idx)
+        patients = s["pending_patients"]
+        if not patients:
+            await safe_edit(query, "✅  Patient supprimé. Liste vide.", kb_cancel())
+            return
+        await safe_edit(query, f"✅  *{nom}* retiré.\n\n{txt_pending_list(patients)}", kb_pending_confirm(len(patients)))
         return
 
     if cb == "add_patient":
         s["state"] = "form_nom"
         s["form"] = {}
         s["edit_idx"] = None
+        s["list_action"] = None
         await safe_edit(query, "➕  *Nouveau patient*\n\n👤  Entrez le *Nom et Prénom* :", kb_cancel())
         return
 
@@ -544,78 +590,22 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, f"✅  *{nom}* supprimé.\n\n{txt_list_header(unit, product, True)}", kb_patient_list(unit, product, True, 0))
         return
 
-    # ── Pending patients review ──
-    if cb == "pending_review":
-        patients = s.get("pending_patients", [])
-        if not patients:
-            await safe_edit(query, "Aucun patient en attente.", kb_cancel())
-            return
-        await safe_edit(query, txt_pending_list(patients), kb_pending_confirm(len(patients)))
-        return
-
-    if cb == "pending_confirm":
-        patients = s.get("pending_patients", [])
-        unit = s["unit"]
-        product = s["product"]
-        data = load_data()
-        action = s.get("list_action", "admin_new_list")
-        if action == "admin_update_list":
-            data[unit][product] = []
-        for p in patients:
-            p["id"] = int(datetime.now().timestamp())
-            data[unit][product].append(p)
-        save_data(data)
-        s["pending_patients"] = []
-        s["state"] = "view_list"
-        s["page"] = 0
-        await safe_edit(query, f"✅  *{len(patients)} patient(s) enregistré(s) avec succès !*\n\n{txt_list_header(unit, product, True)}", kb_patient_list(unit, product, True, 0))
-        return
-
-    if cb == "pending_edit_select":
-        patients = s.get("pending_patients", [])
-        await safe_edit(query, "✏️  *Quel patient voulez-vous modifier ?*", kb_pending_select(patients, "edit"))
-        return
-
-    if cb == "pending_delete_select":
-        patients = s.get("pending_patients", [])
-        await safe_edit(query, "🗑️  *Quel patient voulez-vous supprimer ?*", kb_pending_select(patients, "delete"))
-        return
-
-    if cb.startswith("pending_edit_"):
-        idx = int(cb[13:])
-        s["pending_edit_idx"] = idx
-        s["state"] = "pending_form_nom"
-        s["form"] = dict(s["pending_patients"][idx])
-        p = s["pending_patients"][idx]
-        await safe_edit(query, f"✏️  *Modifier*\n\nNom actuel : *{p.get('nomPrenom','—')}*\n\n👤  Nouveau *Nom et Prénom* :", kb_cancel())
-        return
-
-    if cb.startswith("pending_delete_"):
-        idx = int(cb[15:])
-        nom = s["pending_patients"][idx].get("nomPrenom", "—")
-        s["pending_patients"].pop(idx)
-        patients = s["pending_patients"]
-        if not patients:
-            await safe_edit(query, "✅  Patient supprimé. Liste vide.", kb_cancel())
-            return
-        await safe_edit(query, f"✅  *{nom}* retiré.\n\n{txt_pending_list(patients)}", kb_pending_confirm(len(patients)))
-        return
-
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     s = get_session(chat_id)
     state = s.get("state", "start")
 
+    # ── Photo handler ──
     if update.message.photo and state == "await_photo":
         await update.message.reply_text("📸  *Photo reçue. Lecture en cours...*\n\n⏳ Veuillez patienter.", parse_mode="Markdown")
         try:
             photo = update.message.photo[-1]
             file = await ctx.bot.get_file(photo.file_id)
             image_bytes = await file.download_as_bytearray()
-            patients_raw = await read_sheet_with_claude(bytes(image_bytes))
+            patients_raw = await read_sheet_with_gemini(bytes(image_bytes))
             patients_filtered = filter_patients(patients_raw)
             if not patients_filtered:
-                await update.message.reply_text("⚠️  Aucun patient valide trouvé dans la photo. Réessayez avec une image plus claire.")
+                await update.message.reply_text("⚠️  Aucun patient valide trouvé. Réessayez avec une image plus nette.")
                 return
             s["pending_patients"] = patients_filtered
             s["state"] = "pending_review"
@@ -625,20 +615,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_pending_confirm(len(patients_filtered))
             )
         except Exception as e:
-            logger.error(f"Claude API error: {e}")
-            await update.message.reply_text(f"❌  Erreur lors de la lecture. Réessayez avec une image plus nette.")
+            logger.error(f"Gemini error: {e}")
+            await update.message.reply_text("❌  Erreur lors de la lecture. Réessayez.")
         return
 
     if not update.message.text:
         return
-
     text = update.message.text.strip()
 
     if state == "await_admin_pin":
         if text == ADMIN_PIN:
             s["is_admin"] = True
             s["state"] = "select_unit"
-            await update.message.reply_text("✅  *Accès admin accordé !*\n\nChoisissez votre unité :", parse_mode="Markdown", reply_markup=kb_units(True))
+            await update.message.reply_text("✅  *Accès admin accordé !*\n\nChoisissez votre unité :", parse_mode="Markdown", reply_markup=kb_units())
         else:
             await update.message.reply_text("❌  Code incorrect. Réessayez :")
         return
@@ -656,27 +645,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌  Code incorrect. Réessayez :")
         return
 
-    # ── Patient form (manual) ──
-    form_state = state if not state.startswith("pending_") else state.replace("pending_", "")
-
-    async def next_form_step(current_state, field, next_state, next_question):
-        s["form"][field] = "" if text == "-" else text
-        s["state"] = next_state
-        await update.message.reply_text(next_question, parse_mode="Markdown", reply_markup=kb_cancel())
-
-    if state in ("form_nom", "pending_form_nom"):
+    if state == "form_nom":
         s["form"]["nomPrenom"] = text
-        s["state"] = "pending_form_ord" if state.startswith("pending_") else "form_ord"
+        s["state"] = "form_ord"
         await update.message.reply_text("📋  *N° Ordonnance*\n\n(ou `-` pour ignorer) :", parse_mode="Markdown", reply_markup=kb_cancel())
         return
 
-    if state in ("form_ord", "pending_form_ord"):
+    if state == "form_ord":
         s["form"]["nOrdonnance"] = "" if text == "-" else text
-        s["state"] = "pending_form_date" if state.startswith("pending_") else "form_date"
+        s["state"] = "form_date"
         await update.message.reply_text("📅  *Date de début*\n\nFormat JJ/MM/AAAA (ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
         return
 
-    if state in ("form_date", "pending_form_date"):
+    if state == "form_date":
         if text != "-":
             try:
                 s["form"]["date"] = datetime.strptime(text, "%d/%m/%Y").strftime("%Y-%m-%d")
@@ -685,17 +666,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
         else:
             s["form"]["date"] = ""
-        s["state"] = "pending_form_gtt" if state.startswith("pending_") else "form_gtt"
+        s["state"] = "form_gtt"
         await update.message.reply_text("💧  *Nombre de GTT*\n\n(ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
         return
 
-    if state in ("form_gtt", "pending_form_gtt"):
+    if state == "form_gtt":
         s["form"]["nbreGTT"] = "" if text == "-" else text
-        s["state"] = "pending_form_flacon" if state.startswith("pending_") else "form_flacon"
+        s["state"] = "form_flacon"
         await update.message.reply_text("🔮  *Date prochain flacon*\n\nFormat JJ/MM/AAAA (ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
         return
 
-    if state in ("form_flacon", "pending_form_flacon"):
+    if state == "form_flacon":
         if text != "-":
             try:
                 s["form"]["prochainFlacon"] = datetime.strptime(text, "%d/%m/%Y").strftime("%Y-%m-%d")
@@ -704,41 +685,116 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
         else:
             s["form"]["prochainFlacon"] = ""
-        s["state"] = "pending_form_notes" if state.startswith("pending_") else "form_notes"
+        s["state"] = "form_notes"
         await update.message.reply_text("📝  *Notes*\n\n(ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
         return
 
-    if state in ("form_notes", "pending_form_notes"):
+    if state == "form_notes":
         s["form"]["notes"] = "" if text == "-" else text
         saved = s["form"].copy()
-
-        if state == "pending_form_notes":
-            idx = s.get("pending_edit_idx")
-            s["pending_patients"][idx] = saved
-            s["form"] = {}
-            s["pending_edit_idx"] = None
-            s["state"] = "pending_review"
-            patients = s["pending_patients"]
-            await update.message.reply_text(f"✅  Patient modifié !\n\n{txt_pending_list(patients)}", parse_mode="Markdown", reply_markup=kb_pending_confirm(len(patients)))
+        data = load_data()
+        unit = s["unit"]
+        product = s["product"]
+        edit_idx = s.get("edit_idx")
+        if edit_idx is not None:
+            data[unit][product][edit_idx] = {**data[unit][product][edit_idx], **saved}
+            action = "modifié"
         else:
-            data = load_data()
-            unit = s["unit"]
-            product = s["product"]
-            edit_idx = s.get("edit_idx")
-            if edit_idx is not None:
-                data[unit][product][edit_idx] = {**data[unit][product][edit_idx], **saved}
-                action = "modifié"
-            else:
-                saved["id"] = int(datetime.now().timestamp())
-                data[unit][product].append(saved)
-                action = "ajouté"
-            save_data(data)
+            saved["id"] = int(datetime.now().timestamp())
+            data[unit][product].append(saved)
+            action = "ajouté"
+        save_data(data)
+        s["form"] = {}
+        s["edit_idx"] = None
+
+        # If adding new list, ask for next patient
+        if s.get("list_action") == "new_list":
+            s["state"] = "form_nom"
             s["form"] = {}
-            s["edit_idx"] = None
+            await update.message.reply_text(
+                f"✅  *{saved.get('nomPrenom','—')}* ajouté !\n\n{txt_patient_card(saved)}\n\n👤  Patient suivant — *Nom et Prénom*\n(ou tapez `fin` pour terminer) :",
+                parse_mode="Markdown",
+                reply_markup=kb_cancel()
+            )
+        else:
             s["state"] = "view_list"
             s["page"] = 0
             await update.message.reply_text(f"✅  *Patient {action} !*\n\n{txt_patient_card(saved)}", parse_mode="Markdown")
             await update.message.reply_text(txt_list_header(unit, product, True), parse_mode="Markdown", reply_markup=kb_patient_list(unit, product, True, 0))
+        return
+
+    # Handle "fin" to stop adding patients in new list mode
+    if state == "form_nom" and text.lower() == "fin" and s.get("list_action") == "new_list":
+        s["list_action"] = None
+        s["state"] = "view_list"
+        s["page"] = 0
+        unit = s["unit"]
+        product = s["product"]
+        await update.message.reply_text(
+            f"✅  *Liste enregistrée !*\n\n{txt_list_header(unit, product, True)}",
+            parse_mode="Markdown",
+            reply_markup=kb_patient_list(unit, product, True, 0)
+        )
+        return
+
+    # ── Pending form (editing extracted patient) ──
+    if state == "pending_form_nom":
+        s["form"]["nomPrenom"] = text
+        s["state"] = "pending_form_ord"
+        await update.message.reply_text("📋  *N° Ordonnance* (ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
+        return
+
+    if state == "pending_form_ord":
+        s["form"]["nOrdonnance"] = "" if text == "-" else text
+        s["state"] = "pending_form_date"
+        await update.message.reply_text("📅  *Date* JJ/MM/AAAA (ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
+        return
+
+    if state == "pending_form_date":
+        if text != "-":
+            try:
+                s["form"]["date"] = datetime.strptime(text, "%d/%m/%Y").strftime("%Y-%m-%d")
+            except:
+                await update.message.reply_text("⚠️  Format invalide ! JJ/MM/AAAA ou `-` :", reply_markup=kb_cancel())
+                return
+        else:
+            s["form"]["date"] = ""
+        s["state"] = "pending_form_gtt"
+        await update.message.reply_text("💧  *Nbre de GTT* (ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
+        return
+
+    if state == "pending_form_gtt":
+        s["form"]["nbreGTT"] = "" if text == "-" else text
+        s["state"] = "pending_form_flacon"
+        await update.message.reply_text("🔮  *Date prochain flacon* JJ/MM/AAAA (ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
+        return
+
+    if state == "pending_form_flacon":
+        if text != "-":
+            try:
+                s["form"]["prochainFlacon"] = datetime.strptime(text, "%d/%m/%Y").strftime("%Y-%m-%d")
+            except:
+                await update.message.reply_text("⚠️  Format invalide ! JJ/MM/AAAA ou `-` :", reply_markup=kb_cancel())
+                return
+        else:
+            s["form"]["prochainFlacon"] = ""
+        s["state"] = "pending_form_notes"
+        await update.message.reply_text("📝  *Notes* (ou `-`) :", parse_mode="Markdown", reply_markup=kb_cancel())
+        return
+
+    if state == "pending_form_notes":
+        s["form"]["notes"] = "" if text == "-" else text
+        idx = s.get("pending_edit_idx")
+        s["pending_patients"][idx] = s["form"].copy()
+        s["form"] = {}
+        s["pending_edit_idx"] = None
+        s["state"] = "pending_review"
+        patients = s["pending_patients"]
+        await update.message.reply_text(
+            f"✅  Modifié !\n\n{txt_pending_list(patients)}",
+            parse_mode="Markdown",
+            reply_markup=kb_pending_confirm(len(patients))
+        )
         return
 
     await update.message.reply_text("Tapez /start pour commencer. 🏥")
