@@ -47,7 +47,9 @@ Ne retourne rien d'autre que le JSON."""
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_b64}"
+                            }
                         },
                         {"type": "text", "text": prompt}
                     ]
@@ -55,6 +57,7 @@ Ne retourne rien d'autre que le JSON."""
             }
         )
         result = response.json()
+        logger.info(f"Groq response: {json.dumps(result)[:500]}")
         text = result["choices"][0]["message"]["content"].strip()
         text = text.replace("```json", "").replace("```", "").strip()
         patients = json.loads(text)
