@@ -12,9 +12,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_KEY_HERE")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "YOUR_GROQ_KEY_HERE")
 
-async def read_sheet_with_gemini(image_bytes: bytes) -> list:
+async def read_sheet_with_groq(image_bytes: bytes) -> list:
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
     prompt = """Tu es un assistant médical. Lis cette feuille de suivi hospitalier manuscrite.
 Extrais uniquement les patients qui ont des données valides.
@@ -32,18 +32,30 @@ Format exact:
 Si une valeur n'est pas lisible, mets une chaîne vide "".
 Ne retourne rien d'autre que le JSON."""
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.post(url, json={
-            "contents": [{
-                "parts": [
-                    {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
-                    {"text": prompt}
-                ]
-            }]
-        })
+        response = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                "max_tokens": 2000,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}
+                        },
+                        {"type": "text", "text": prompt}
+                    ]
+                }]
+            }
+        )
         result = response.json()
-        text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+        text = result["choices"][0]["message"]["content"].strip()
         text = text.replace("```json", "").replace("```", "").strip()
         patients = json.loads(text)
         converted = []
@@ -602,7 +614,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             photo = update.message.photo[-1]
             file = await ctx.bot.get_file(photo.file_id)
             image_bytes = await file.download_as_bytearray()
-            patients_raw = await read_sheet_with_gemini(bytes(image_bytes))
+            patients_raw = await read_sheet_with_groq(bytes(image_bytes))
             patients_filtered = filter_patients(patients_raw)
             if not patients_filtered:
                 await update.message.reply_text("⚠️  Aucun patient valide trouvé. Réessayez avec une image plus nette.")
@@ -817,3 +829,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
