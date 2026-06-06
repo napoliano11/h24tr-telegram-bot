@@ -71,7 +71,40 @@ Ne retourne rien d'autre que le JSON."""
             converted.append(p)
         return converted
 
-def filter_patients(patients):
+def calculate_prochain_flacon(start_date_str, nbre_gtt, product):
+    """Calculate next flacon date from start date and daily GTT/ml"""
+    if not start_date_str or not nbre_gtt:
+        return ""
+    try:
+        gtt = float(str(nbre_gtt).replace(",", "."))
+        if gtt <= 0:
+            return ""
+        capacity = FLACON_CAPACITY.get(product, 1200)
+        days = int(capacity / gtt)
+        from datetime import timedelta
+        start = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+        prochain = start + timedelta(days=days)
+        return prochain.strftime("%Y-%m-%d")
+    except:
+        return ""
+
+def enrich_patients(patients, product):
+    """Auto-calculate missing prochain flacon dates"""
+    for p in patients:
+        if not p.get("prochainFlacon") and p.get("date") and p.get("nbreGTT"):
+            calculated = calculate_prochain_flacon(p["date"], p["nbreGTT"], product)
+            if calculated:
+                p["prochainFlacon"] = calculated
+                p["auto_calculated"] = True
+    return patients
+
+def is_list_outdated(patients):
+    """Check if all patients with flacon dates are outdated by more than 3 days"""
+    patients_with_dates = [p for p in patients if p.get("prochainFlacon")]
+    if not patients_with_dates:
+        return False
+    outdated = [p for p in patients_with_dates if days_until_simple(p["prochainFlacon"]) is not None and days_until_simple(p["prochainFlacon"]) < -3]
+    return len(outdated) == len(patients_with_dates)
     seen = {}
     for p in patients:
         name = p.get("nomPrenom", "").strip().lower()
@@ -107,6 +140,7 @@ UNIT_PINS = {
 ADMIN_PIN = "2510"
 PRODUCTS = ["Largactil GTT", "Nozinan GTT", "Risperdal GTT"]
 PRODUCT_ICONS = {"Largactil GTT": "💊", "Nozinan GTT": "💉", "Risperdal GTT": "🔬"}
+FLACON_CAPACITY = {"Largactil GTT": 1200, "Nozinan GTT": 1200, "Risperdal GTT": 60}
 DATA_FILE = "data.json"
 USERS_FILE = "users.json"
 
@@ -518,6 +552,12 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, txt_pending_list(patients), kb_pending_confirm(len(patients)))
         return
 
+    if cb == "force_pending":
+        patients = s.get("pending_patients", [])
+        s["state"] = "pending_review"
+        await safe_edit(query, txt_pending_list(patients), kb_pending_confirm(len(patients)))
+        return
+
     if cb == "pending_confirm":
         patients = s.get("pending_patients", [])
         unit = s["unit"]
@@ -615,9 +655,22 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             file = await ctx.bot.get_file(photo.file_id)
             image_bytes = await file.download_as_bytearray()
             patients_raw = await read_sheet_with_groq(bytes(image_bytes))
-            patients_filtered = filter_patients(patients_raw)
+            patients_enriched = enrich_patients(patients_raw, s.get("product", "Largactil GTT"))
+            patients_filtered = filter_patients(patients_enriched)
             if not patients_filtered:
                 await update.message.reply_text("⚠️  Aucun patient valide trouvé. Réessayez avec une image plus nette.")
+                return
+            if is_list_outdated(patients_filtered):
+                await update.message.reply_text(
+                    "⚠️  *Liste ancienne détectée !*\n\nTous les patients de cette feuille ont des dates de prochain flacon dépassées de plus de 3 jours.\n\nCette liste semble être une ancienne feuille. Voulez-vous quand même continuer ?",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅  Continuer quand même", callback_data="force_pending")],
+                        [InlineKeyboardButton("❌  Annuler", callback_data="back_list")]
+                    ])
+                )
+                s["pending_patients"] = patients_filtered
+                s["state"] = "pending_outdated"
                 return
             s["pending_patients"] = patients_filtered
             s["state"] = "pending_review"
@@ -829,4 +882,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
